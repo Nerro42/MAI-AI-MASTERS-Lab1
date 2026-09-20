@@ -1,2 +1,148 @@
-# MAI-AI-MASTERS-Lab1
-Lab1
+# Лабораторная работа по курсу "Искусственный интеллект"
+# Создание своего нейросетевого фреймворка
+
+## gradnet
+
+Учебный фреймворк на NumPy с **обратным автоматическим дифференцированием**.
+Сеть задаётся списком слоёв, данные гоняются через `Pack`, обучение — через `Loop`.
+Графического UI нет: всё из Python-скриптов.
+
+Отличие от «ручного backward у каждого слоя»: градиенты считаются по ленте операций
+(`Tensor` + родители + локальная производная). Слой знает только `forward`; `backward`
+собирается сам. Для отладки есть численная проверка градиента (`gradcheck`) и печать
+графа (`dump_graph`).
+
+### Возможности
+
+1. Многослойная сеть перечислением модулей: `Stack([Affine(...), Relu(), ...])`.
+2. Датасет `Pack`: `map`, `shuffle`, `split` (в т.ч. стратификация), мини-батчи.
+3. Три оптимизатора и клиппинг: `SGD`, `HeavyBall` (momentum SGD), `RMSProp`, `clip_grad_norm`.
+4. Передаточные функции `Relu`, `LeakyRelu`, `Tanh`, `Sigmoid`; лоссы `nll` (классификация) и `mse` (регрессия).
+5. Обучение в несколько строк через `Loop`, с метрикой, клиппингом и val-проходом.
+6. Примеры: Iris, digits (компактный MNIST), diabetes, две спирали с картой решений.
+
+### Установка
+
+```bash
+python -m pip install -e .
+```
+
+Нужны Python 3.10+ и NumPy. Примеры тянут датасеты из scikit-learn.
+
+### Обучение в несколько строк
+
+```python
+from sklearn.datasets import load_iris
+from gradnet import Affine, HeavyBall, Loop, Pack, Relu, Stack, accuracy, nll, standardize
+
+X, y = load_iris(return_X_y=True)
+train, val = Pack(X, y).split(0.75, seed=7, stratify=True)
+train, val = standardize(train, val)
+
+net = Stack([
+    Affine(4, 16, seed=1), Relu(),
+    Affine(16, 3, seed=2),
+])
+Loop(net, nll, HeavyBall(net.parameters(), lr=0.05, mu=0.9), metric=accuracy, clip=5.0).run(
+    train, val, epochs=80, batch=16
+)
+```
+
+`Loop` на каждой эпохе перемешивает train, считает лосс, делает `backward`,
+при необходимости режет норму градиента и шагает оптимизатором.
+
+### Автодифф
+
+`Tensor` хранит `data`, `grad` и ссылки на родителей. Операции (`+`, `*`, `@`,
+`relu`, `mean`, …) дописывают узел в граф. `loss.backward()` делает топологический
+обход и накапливает градиенты, в том числе после broadcasting (например смещение `b`
+формы `(out,)`).
+
+```python
+from gradnet import Tensor, dump_graph
+
+w = Tensor([[0.2, -0.1], [0.4, 0.3]], requires_grad=True)
+x = Tensor([[1.0, 2.0]])
+y = (x @ w).relu().mean()
+dump_graph(y)
+y.backward()
+print(w.grad)
+```
+
+Численная проверка (центральная разность) против аналитического градиента:
+
+```python
+from gradnet import Tensor, gradcheck
+
+ok, analytic, numeric = gradcheck(lambda t: (t.relu() ** 2).mean(), x_np)
+```
+
+`nll` — fused-операция: softmax через log-sum-exp, чтобы большие логиты не взрывали `exp`.
+
+### Данные
+
+```python
+pack = Pack(X, y)
+pack = pack.map(lambda X, y: (X / 255.0, y))
+train, val = pack.split(0.8, seed=0, stratify=True)
+train, val = standardize(train, val)          # mean/std только по train
+for xb, yb in train.batches(32, shuffle=True, seed=epoch):
+    ...
+```
+
+`standardize` учит статистики на train и применяет их к остальным `Pack`.
+Для картинок: `flatten_rows` и `scale_pixels(255)`.
+
+### Оптимизаторы
+
+Все пишут в `param.data`, читая `param.grad`.
+
+| Класс       | Правило |
+|-------------|---------|
+| `SGD`       | `p -= lr * g` (+ optional L2) |
+| `HeavyBall` | `v = mu*v + g`, `p -= lr * v` |
+| `RMSProp`   | скользящее среднее `g²`, шаг нормируется |
+
+Клиппинг — отдельная процедура, её вызывает `Loop`, если передан `clip=...`:
+
+```python
+clip_grad_norm(model.parameters(), max_norm=5.0)
+```
+
+### Примеры
+
+```bash
+python examples/iris_clf.py
+python examples/digits.py
+python examples/diabetes_reg.py
+python examples/spirals.py
+```
+
+- `iris_clf.py` — 3 класса, 4 признака.
+- `digits.py` — 8×8 рукописные цифры (тот же тип задачи, что MNIST, без скачивания 70k картинок).
+- `diabetes_reg.py` — регрессия, MSE + RMSE.
+- `spirals.py` — две вложенные спирали; после обучения пишет `examples/spiral_boundary.png`.
+
+### Тесты
+
+```bash
+python -m pytest -q
+```
+
+Проверяются: совпадение autodiff с конечными разностями, устойчивость `nll`,
+батчи/split/map, шаги оптимизаторов, клиппинг, XOR до accuracy 1.0.
+
+### Структура
+
+```
+gradnet/
+  tensor.py   # лента, операции, dump_graph
+  nn.py       # Affine, активации, Dropout, Stack
+  losses.py   # nll, mse, accuracy, rmse
+  optim.py    # SGD, HeavyBall, RMSProp, clip_grad_norm
+  data.py     # Pack, standardize, map-хелперы
+  train.py    # Loop
+  check.py    # gradcheck
+examples/
+tests/
+```
